@@ -1,0 +1,11 @@
+#include <stdio.h>
+#include <unistd.h>
+
+int main() {
+   printf("main reached\n");
+    int x = 5;
+   int y = 0;
+   int z;
+   printf("x = %d\n", x);
+   return 0;
+}

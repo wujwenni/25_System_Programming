@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+
 #define MAX_ITEMS 1024
 #define LIST_START_ROW 2
 #define NAME_START_COL 2
@@ -65,7 +66,7 @@ int main() {
     int mouse_row = -1, mouse_col = -1;
     MEVENT ev;
 
-    while (1) {
+    while (1) { // 마우스 클릭 핸들링, 선택한 영역이 디렉터리면 새로고침 하여 하위 내용, 파일이면 일단 아무것도 하지 않음.
         werase(win_left); box(win_left, 0, 0);
         // 상단 경로/안내
         const char *display_path = cur_path;
@@ -143,7 +144,6 @@ int main() {
                 }
             }
         }
-        // 메모리 해제
         for (int i = 0; i < n; i++) free(names[i]);
     }
     delwin(win_left); delwin(win_mid); delwin(win_right); endwin();
