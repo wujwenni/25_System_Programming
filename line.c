@@ -38,10 +38,29 @@ int main (int argc, char* argv[]) {
         waitpid(child, &status, 0);
         int steps = 0;
 
-        // 진행 상황을 보기 위해 버퍼링 끔
         setvbuf(stdout, NULL, _IONBF, 0); 
         printf("Debugger started. Skipping library initialization...\n");
 
+        // 사용자 코드 영역에 도달할 때까지 자동 진행
+        while (1) {
+            if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                break; // 종료되면 루프 탈출
+            }
+            
+            ptrace(PTRACE_GETREGS, child, NULL, &regs);
+            
+            // 사용자 코드 영역 (일반적으로 0x400000~0x600000 사이)
+            if (regs.rip >= 0x400000 && regs.rip < 0x700000000000) {
+                printf("Reached user code at RIP: 0x%llx\n", regs.rip);
+                break; // 사용자 코드 진입, 디버깅 시작
+            }
+            
+            ptrace(PTRACE_SINGLESTEP, child, NULL, NULL);
+            waitpid(child, &status, 0);
+            steps++;
+        }
+
+        // 여기서부터 실제 줄 단위 디버깅 시작
         while (1) {
             if (WIFEXITED(status)) {
                 printf("[EXIT] status: %d, steps: %d\n", WEXITSTATUS(status), steps);
@@ -49,42 +68,35 @@ int main (int argc, char* argv[]) {
             } else if (WIFSIGNALED(status)) {
                 printf("[SIGEXIT] signo: %d, steps: %d\n", WTERMSIG(status), steps);
                 break;
-            } else if (WIFSTOPPED(status)) {
-                ptrace(PTRACE_GETREGS, child, NULL, &regs);
-
-                // [핵심 수정] 최적화: 라이브러리 영역(높은 주소)은 addr2line 수행 없이 무조건 스킵
-                // 64비트 리눅스에서 사용자 코드는 보통 0x400000 근처, 라이브러리는 0x7f... 에 위치함
-                // 따라서 RIP가 0x700000000000 보다 크면 라이브러리라고 판단하고 스킵.
-                if (regs.rip >= 0x700000000000) {
-                    ptrace(PTRACE_SINGLESTEP, child, NULL, NULL);
-                    waitpid(child, &status, 0);
-                    steps++;
-                    continue; 
-                }
-
-                // 여기부터는 사용자 영역 코드이므로 addr2line 수행
-                addr2line(argv[1], regs.rip, addrline, sizeof(addrline));
-
-                // 혹시 모를 '??' 처리
-                if (strncmp(addrline, "??", 2) == 0) {
-                    ptrace(PTRACE_SINGLESTEP, child, NULL, NULL);
-                    waitpid(child, &status, 0);
-                    steps++;
-                    continue;
-                }
-
-                if (strcmp(addrline, prevline) != 0) {
-                    printf("\n--- Source line: %s ---\n", addrline);
-                    printf("RIP: 0x%llx\n", regs.rip);
-                    
-                    // 타겟 프로그램의 변수나 상태는 메모리를 직접 읽어야 보임 (지금은 생략)
-                    
-                    strcpy(prevline, addrline);
-                    printf("Press Enter to step...");
-                    getchar();
-                    // sleep(3); // getchar가 있으므로 sleep은 불필요
-                }
             }
+            
+            ptrace(PTRACE_GETREGS, child, NULL, &regs);
+            
+            // 라이브러리 영역은 스킵
+            if (regs.rip >= 0x700000000000) {
+                ptrace(PTRACE_SINGLESTEP, child, NULL, NULL);
+                waitpid(child, &status, 0);
+                steps++;
+                continue;
+            }
+
+            addr2line(argv[1], regs.rip, addrline, sizeof(addrline));
+
+            if (strncmp(addrline, "??", 2) == 0) {
+                ptrace(PTRACE_SINGLESTEP, child, NULL, NULL);
+                waitpid(child, &status, 0);
+                steps++;
+                continue;
+            }
+
+            if (strcmp(addrline, prevline) != 0) {
+                printf("\n--- Source line: %s ---\n", addrline);
+                printf("RIP: 0x%llx\n", regs.rip);
+                strcpy(prevline, addrline);
+                printf("Press Enter to step...");
+                getchar();
+            }
+            
             ptrace(PTRACE_SINGLESTEP, child, NULL, NULL);
             waitpid(child, &status, 0);
             steps++;
