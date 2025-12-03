@@ -1,305 +1,496 @@
+#include "debugger.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ptrace.h>
-#include <sys/types.h>
-#include <sys/user.h>
-#include <sys/wait.h>
 #include <unistd.h>
-#include <ncurses.h>
+#include <sys/ptrace.h>
+#include <sys/wait.h>
+#include <sys/user.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <ctype.h>
 
-#define MAX_LINES     2000
-#define MAX_LINE_LEN  256
-#define MAX_VLINES    (MAX_LINES * 8)
+void dbg_init(Debugger *dbg) {
+    memset(dbg, 0, sizeof(Debugger));
+    dbg->child_pid = -1;
+    dbg->state = DBG_STATE_NOT_STARTED;
+    dbg->instruction_count = 0;
+    dbg->stdout_pipe[0] = -1;
+    dbg->stdout_pipe[1] = -1;
+    dbg->output_length = 0;
+    dbg->current_line = 1;
+    memset(dbg->output_buffer, 0, sizeof(dbg->output_buffer));
+    dbg->addr2line_in = NULL;
+    dbg->addr2line_out = NULL;
+    dbg->addr2line_pid = -1;
+    dbg->gdb_in = NULL;
+    dbg->gdb_out = NULL;
+    dbg->gdb_pid = -1;
+    dbg->variable_count = 0;
+}
 
-typedef struct {
-    char filename[256];
-    char lines[MAX_LINES][MAX_LINE_LEN];
-    int  line_count;
-} SourceCode;
+// Start persistent addr2line process
+static int start_addr2line(Debugger *dbg) {
+    int pipe_in[2];   // Parent writes, addr2line reads
+    int pipe_out[2];  // addr2line writes, parent reads
 
-typedef struct {
-    int src_line;   // 0-based 논리 라인
-    int wrap_idx;   // 그 라인 안에서 몇 번째 접힌 줄인지
-} VisualLine;
-
-SourceCode curCode = {0};
-VisualLine vlines[MAX_VLINES];
-int vline_count = 0;
-
-int gutter_width = 8;   // 화살표 + 라인번호 영역
-int view_start  = 0;    // 현재 페이지의 첫 visual line index
-
-void load_source_file(const char* path);
-void get_addr_line(const char*, unsigned long long, char*, size_t);
-void rebuild_visual_lines(int term_width);
-int  visual_index_for_line(int logical_line); // 1-based 논리 라인
-void draw_ui(int cur_logical_line);
-
-int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <target>\n", argv[0]);
-        return 1;
+    if (pipe(pipe_in) == -1 || pipe(pipe_out) == -1) {
+        return -1;
     }
 
-    pid_t child = fork();
-    if (child == 0) {
-        ptrace(PTRACE_TRACEME, 0, NULL, NULL);
-        execl(argv[1], argv[1], NULL);
-        perror("execl");
-        return 1;
+    pid_t pid = fork();
+    if (pid == -1) {
+        close(pipe_in[0]); close(pipe_in[1]);
+        close(pipe_out[0]); close(pipe_out[1]);
+        return -1;
     }
 
-    int status;
-    struct user_regs_struct regs;
-    char addr_info[256];
-    char current_file[256] = "";
-    int  current_line = 0;
+    if (pid == 0) {
+        // Child: addr2line process
+        close(pipe_in[1]);   // Close write end of input
+        close(pipe_out[0]);  // Close read end of output
 
-    waitpid(child, &status, 0);
+        dup2(pipe_in[0], STDIN_FILENO);
+        dup2(pipe_out[1], STDOUT_FILENO);
 
-    initscr();
-    cbreak();
-    noecho();
-    keypad(stdscr, TRUE);
-    curs_set(0);
-    start_color();
-    init_pair(1, COLOR_GREEN, COLOR_BLACK);
+        close(pipe_in[0]);
+        close(pipe_out[1]);
 
-    int h, w;
-    getmaxyx(stdscr, h, w);
-    rebuild_visual_lines(w);
+        // Run addr2line in interactive mode (-f for function names, -e for executable)
+        execlp("addr2line", "addr2line", "-f", "-e", dbg->executable_path, NULL);
+        perror("execlp addr2line");
+        exit(1);
+    } else {
+        // Parent
+        close(pipe_in[0]);   // Close read end of input
+        close(pipe_out[1]);  // Close write end of output
 
-    mvprintw(10, 10, "Skipping library initialization..");
-    refresh();
+        dbg->addr2line_in = fdopen(pipe_in[1], "w");
+        dbg->addr2line_out = fdopen(pipe_out[0], "r");
+        dbg->addr2line_pid = pid;
 
-    // 라이브러리 초기화 스킵 루프 (원래 코드 그대로)
-    while (1) {
-        if (WIFEXITED(status) || WIFSIGNALED(status)) break;
-
-        ptrace(PTRACE_GETREGS, child, NULL, &regs);
-
-        if (regs.rip >= 0x400000 && regs.rip < 0x700000000000) {
-            break;
+        if (!dbg->addr2line_in || !dbg->addr2line_out) {
+            return -1;
         }
-        ptrace(PTRACE_SINGLESTEP, child, NULL, NULL);
-        waitpid(child, &status, 0);
+
+        // Disable buffering for immediate response
+        setbuf(dbg->addr2line_in, NULL);
+        setbuf(dbg->addr2line_out, NULL);
+
+        return 0;
+    }
+}
+
+// Stop persistent addr2line process
+static void stop_addr2line(Debugger *dbg) {
+    if (dbg->addr2line_in) {
+        fclose(dbg->addr2line_in);
+        dbg->addr2line_in = NULL;
+    }
+    if (dbg->addr2line_out) {
+        fclose(dbg->addr2line_out);
+        dbg->addr2line_out = NULL;
+    }
+    if (dbg->addr2line_pid > 0) {
+        kill(dbg->addr2line_pid, SIGTERM);
+        waitpid(dbg->addr2line_pid, NULL, 0);
+        dbg->addr2line_pid = -1;
+    }
+}
+
+// Start GDB MI process for variable tracking
+
+// Stop GDB MI process
+static void stop_gdb_mi(Debugger *dbg) {
+    if (dbg->gdb_in) {
+        fprintf(dbg->gdb_in, "-gdb-exit\n");
+        fclose(dbg->gdb_in);
+        dbg->gdb_in = NULL;
+    }
+    if (dbg->gdb_out) {
+        fclose(dbg->gdb_out);
+        dbg->gdb_out = NULL;
+    }
+    if (dbg->gdb_pid > 0) {
+        kill(dbg->gdb_pid, SIGTERM);
+        waitpid(dbg->gdb_pid, NULL, 0);
+        dbg->gdb_pid = -1;
+    }
+}
+
+int dbg_load_program(Debugger *dbg, const char *executable_path, const char *source_path) {
+    strncpy(dbg->executable_path, executable_path, sizeof(dbg->executable_path) - 1);
+    strncpy(dbg->source_path, source_path, sizeof(dbg->source_path) - 1);
+    dbg->state = DBG_STATE_NOT_STARTED;
+
+    // Clear output buffer for new session
+    dbg->output_length = 0;
+    memset(dbg->output_buffer, 0, sizeof(dbg->output_buffer));
+
+    // Start persistent addr2line process
+    if (start_addr2line(dbg) != 0) {
+        return -1;
     }
 
-    while (1) {
-        if (WIFEXITED(status) || WIFSIGNALED(status)) break;
-
-        ptrace(PTRACE_GETREGS, child, NULL, &regs);
-        get_addr_line(argv[1], regs.rip, addr_info, sizeof(addr_info));
-
-        char* colon = strchr(addr_info, ':');
-        if (colon) {
-            *colon = 0;
-            strcpy(current_file, addr_info);
-            current_line = atoi(colon + 1);
-
-            if (strcmp(current_file, "??") != 0) {
-                load_source_file(current_file);
-                getmaxyx(stdscr, h, w);
-                rebuild_visual_lines(w);
-            }
-        }
-
-        // 논리 라인에 맞춰 view_start 조정 (페이지 단위)
-        int v_idx = visual_index_for_line(current_line); // 0-based
-        if (v_idx >= 0) {
-            int view_height = h - 3;
-            int center = v_idx - view_height / 2;
-            if (center < 0) center = 0;
-            if (center > vline_count - view_height)
-                center = (vline_count > view_height) ? vline_count - view_height : 0;
-            view_start = center;
-        }
-
-        draw_ui(current_line);
-
-        int ch = getch();
-
-        if (ch == KEY_RESIZE) {
-            getmaxyx(stdscr, h, w);
-            rebuild_visual_lines(w);
-            draw_ui(current_line);
-            continue;
-        }
-
-        if (ch == 'q' || ch == 'Q') {
-            break;
-        } else if (ch == KEY_F(10)) {
-            char start_file[256];
-            int start_line_num = current_line;
-            strcpy(start_file, current_file);
-
-            while (1) {
-                ptrace(PTRACE_SINGLESTEP, child, NULL, NULL);
-                waitpid(child, &status, 0);
-
-                if (WIFEXITED(status) || WIFSIGNALED(status)) break;
-
-                ptrace(PTRACE_GETREGS, child, NULL, &regs);
-                if (regs.rip >= 0x700000000000) continue;
-
-                char temp_info[256];
-                get_addr_line(argv[1], regs.rip, temp_info, sizeof(temp_info));
-
-                char* temp_colon = strchr(temp_info, ':');
-                if (temp_colon) {
-                    *temp_colon = 0;
-                    int new_line = atoi(temp_colon + 1);
-                    if ((strcmp(temp_info, "??") != 0 &&
-                         strcmp(temp_info, start_file) != 0) ||
-                        (strcmp(temp_info, start_file) == 0 &&
-                         new_line != start_line_num)) {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    endwin();
-    printf("Target exited\n");
     return 0;
 }
 
-void load_source_file(const char* path) {
-    if (strcmp(curCode.filename, path) == 0) return;
-
-    FILE* fp = fopen(path, "r");
-    if (!fp) {
-        curCode.line_count = 0;
-        snprintf(curCode.filename, sizeof(curCode.filename),
-                 "%s File is not found)\n", path);
-        return;
+int dbg_start(Debugger *dbg) {
+    if (dbg->state != DBG_STATE_NOT_STARTED && dbg->state != DBG_STATE_EXITED) {
+        return -1;
     }
 
-    strncpy(curCode.filename, path, sizeof(curCode.filename) - 1);
-    curCode.filename[sizeof(curCode.filename) - 1] = '\0';
-    curCode.line_count = 0;
-
-    while (curCode.line_count < MAX_LINES &&
-           fgets(curCode.lines[curCode.line_count], MAX_LINE_LEN, fp)) {
-        curCode.lines[curCode.line_count]
-            [strcspn(curCode.lines[curCode.line_count], "\n")] = 0;
-        curCode.line_count++;
+    // Create pipe for capturing stdout/stderr
+    if (pipe(dbg->stdout_pipe) == -1) {
+        dbg->state = DBG_STATE_ERROR;
+        return -1;
     }
-    fclose(fp);
-}
 
-void get_addr_line(const char* exe, unsigned long long addr,
-                   char* buf, size_t size) {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "addr2line -e %s %llx", exe, addr);
-    FILE* fp = popen(cmd, "r");
-    if (fp) {
-        if (fgets(buf, size, fp)) {
-            buf[strcspn(buf, "\n")] = 0;
-        } else {
-            strncpy(buf, "??:0", size);
-            buf[size-1] = '\0';
+    pid_t pid = fork();
+    if (pid == -1) {
+        close(dbg->stdout_pipe[0]);
+        close(dbg->stdout_pipe[1]);
+        dbg->state = DBG_STATE_ERROR;
+        return -1;
+    }
+
+    if (pid == 0) {
+        // Child process
+        close(dbg->stdout_pipe[0]);
+        dup2(dbg->stdout_pipe[1], STDOUT_FILENO);
+        dup2(dbg->stdout_pipe[1], STDERR_FILENO);
+        close(dbg->stdout_pipe[1]);
+
+        if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == -1) {
+            perror("ptrace TRACEME");
+            exit(1);
         }
-        pclose(fp);
+
+        char *args[] = {dbg->executable_path, NULL};
+        execv(dbg->executable_path, args);
+        perror("execv");
+        exit(1);
     } else {
-        strncpy(buf, "??:0", size);
-        buf[size-1] = '\0';
+        // Parent process
+        close(dbg->stdout_pipe[1]);
+        dbg->child_pid = pid;
+
+        // Set pipe to non-blocking
+        int flags = fcntl(dbg->stdout_pipe[0], F_GETFL, 0);
+        fcntl(dbg->stdout_pipe[0], F_SETFL, flags | O_NONBLOCK);
+
+        int status;
+        waitpid(pid, &status, 0);
+
+        if (!WIFSTOPPED(status)) {
+            dbg->state = DBG_STATE_ERROR;
+            return -1;
+        }
+
+        // Skip library initialization (like old_dbg.c lines 77-87)
+        struct user_regs_struct regs;
+        while (1) {
+            if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                dbg->state = DBG_STATE_EXITED;
+                return -1;
+            }
+
+            ptrace(PTRACE_GETREGS, pid, NULL, &regs);
+
+            // When RIP is in user code range, stop
+            if (regs.rip >= 0x400000 && regs.rip < 0x700000000000) {
+                break;
+            }
+
+            ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL);
+            waitpid(pid, &status, 0);
+        }
+
+        dbg->state = DBG_STATE_STOPPED;
+        dbg_update_registers(dbg);
+
+        return 0;
     }
 }
 
-// term_width를 기준으로 VisualLine 배열 재구성
-void rebuild_visual_lines(int term_width) {
-    vline_count = 0;
+int dbg_stop(Debugger *dbg) {
+    if (dbg->child_pid > 0) {
+        ptrace(PTRACE_KILL, dbg->child_pid, NULL, NULL);
+        waitpid(dbg->child_pid, NULL, 0);
+        dbg->child_pid = -1;
+    }
+    if (dbg->stdout_pipe[0] != -1) {
+        close(dbg->stdout_pipe[0]);
+        dbg->stdout_pipe[0] = -1;
+    }
 
-    int code_start_x = gutter_width;
-    int code_width = term_width - code_start_x - 1;
-    if (code_width <= 0) code_width = 1;
+    // Stop addr2line and GDB processes
+    stop_addr2line(dbg);
+    stop_gdb_mi(dbg);
 
-    for (int i = 0; i < curCode.line_count; i++) {
-        int len = (int)strlen(curCode.lines[i]);
-        int needed = (len == 0) ? 1 : ( (len + code_width - 1) / code_width );
+    // Clear output buffer when stopping
+    dbg->output_length = 0;
+    memset(dbg->output_buffer, 0, sizeof(dbg->output_buffer));
 
-        for (int w = 0; w < needed && vline_count < MAX_VLINES; w++) {
-            vlines[vline_count].src_line = i;
-            vlines[vline_count].wrap_idx = w;
-            vline_count++;
+    dbg->state = DBG_STATE_NOT_STARTED;
+    return 0;
+}
+
+// Step until source line changes (like old_dbg.c F10 handler)
+int dbg_step_line(Debugger *dbg) {
+    if (dbg->state != DBG_STATE_STOPPED) {
+        return -1;
+    }
+
+    int start_line = dbg->current_line;
+    int status;
+    int max_steps = 10000;
+
+    for (int i = 0; i < max_steps; i++) {
+        // Single step
+        if (ptrace(PTRACE_SINGLESTEP, dbg->child_pid, NULL, NULL) == -1) {
+            dbg->state = DBG_STATE_ERROR;
+            return -1;
+        }
+
+        waitpid(dbg->child_pid, &status, 0);
+
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            dbg->state = DBG_STATE_EXITED;
+            return 0;
+        }
+
+        if (!WIFSTOPPED(status)) {
+            dbg->state = DBG_STATE_ERROR;
+            return -1;
+        }
+
+        dbg_update_registers(dbg);
+
+        // Skip if in library code
+        if (dbg->registers.rip >= 0x700000000000) {
+            continue;
+        }
+
+        // Check if line changed
+        if (dbg->current_line != start_line && dbg->current_line > 0) {
+            break;
         }
     }
+
+    dbg->state = DBG_STATE_STOPPED;
+
+    // Update variables after stepping
+    dbg_update_variables(dbg);
+
+    return 0;
 }
 
-// 1-based logical_line → 해당하는 첫 visual index (0-based), 없으면 -1
-int visual_index_for_line(int logical_line) {
-    int target = logical_line - 1;
-    if (target < 0) return -1;
-
-    for (int i = 0; i < vline_count; i++) {
-        if (vlines[i].src_line == target) {
-            return i;
-        }
+int dbg_update_registers(Debugger *dbg) {
+    if (dbg->child_pid <= 0) {
+        return -1;
     }
-    return -1;
+
+    // Save previous values
+    dbg->prev_registers.rax = dbg->registers.rax;
+    dbg->prev_registers.rbx = dbg->registers.rbx;
+    dbg->prev_registers.rcx = dbg->registers.rcx;
+    dbg->prev_registers.rdx = dbg->registers.rdx;
+    dbg->prev_registers.rip = dbg->registers.rip;
+    dbg->prev_registers.rsp = dbg->registers.rsp;
+    dbg->prev_registers.rbp = dbg->registers.rbp;
+
+    struct user_regs_struct regs;
+    if (ptrace(PTRACE_GETREGS, dbg->child_pid, NULL, &regs) == -1) {
+        return -1;
+    }
+
+    dbg->registers.rax = regs.rax;
+    dbg->registers.rbx = regs.rbx;
+    dbg->registers.rcx = regs.rcx;
+    dbg->registers.rdx = regs.rdx;
+    dbg->registers.rsi = regs.rsi;
+    dbg->registers.rdi = regs.rdi;
+    dbg->registers.rbp = regs.rbp;
+    dbg->registers.rsp = regs.rsp;
+    dbg->registers.rip = regs.rip;
+    dbg->registers.r8 = regs.r8;
+    dbg->registers.r9 = regs.r9;
+    dbg->registers.r10 = regs.r10;
+    dbg->registers.r11 = regs.r11;
+    dbg->registers.r12 = regs.r12;
+    dbg->registers.r13 = regs.r13;
+    dbg->registers.r14 = regs.r14;
+    dbg->registers.r15 = regs.r15;
+
+    dbg->current_rip = regs.rip;
+    dbg->instruction_count++;
+
+    // Update current line using addr2line
+    dbg_get_current_line(dbg);
+
+    return 0;
 }
 
-void draw_ui(int cur_logical_line) {
-    clear();
-    int height, width;
-    getmaxyx(stdscr, height, width);
-
-    attron(A_REVERSE);
-    mvprintw(0, 0, "Debugger: %s | F10: Step | q: Quit", curCode.filename);
-    mvprintw(0, width - 20, " Line: %d", cur_logical_line);
-    for (int i = 0; i < width; i++) mvaddch(1, i, ACS_HLINE);
-    attroff(A_REVERSE);
-
-    int view_height = height - 3;
-    if (view_height < 1) {
-        refresh();
+void dbg_get_current_line(Debugger *dbg) {
+    if (dbg->child_pid <= 0 || !dbg->addr2line_in || !dbg->addr2line_out) {
         return;
     }
 
-    for (int i = 0; i < view_height; i++) {
-        int v_idx = view_start + i;
-        if (v_idx < 0 || v_idx >= vline_count) break;
+    // Send address to addr2line (format: "0x12345678\n")
+    fprintf(dbg->addr2line_in, "0x%llx\n", (unsigned long long)dbg->current_rip);
 
-        int screen_y = i + 2;
+    // Read two lines: function name (we ignore), then filename:line
+    char func_line[256];
+    char result[1024];
 
-        int visual_no = v_idx + 1;
-        mvprintw(screen_y, 0, "%4d ", visual_no);
-
-        int src = vlines[v_idx].src_line;
-        int wrap = vlines[v_idx].wrap_idx;
-
-        int logical_line_num = src + 1;
-
-        // 거터 + 라인 번호
-        if (logical_line_num == cur_logical_line) {
-            attron(COLOR_PAIR(1) | A_BOLD);
-            mvprintw(screen_y, 0, "->");
-            attroff(COLOR_PAIR(1) | A_BOLD);
-        }
-
-        // 코드 본문에서 해당 wrap 부분만 출력
-        int code_start_x = gutter_width;
-        int code_width   = width - code_start_x - 1;
-        if (code_width <= 0) code_width = 1;
-
-        const char* line = curCode.lines[src];
-        int len = (int)strlen(line);
-        int offset = wrap * code_width;
-        if (offset < len) {
-            char buf[1024];
-            int copy_len = len - offset;
-            if (copy_len > code_width) copy_len = code_width;
-            if (copy_len > (int)sizeof(buf) - 1) copy_len = sizeof(buf) - 1;
-
-            memcpy(buf, line + offset, copy_len);
-            buf[copy_len] = '\0';
-
-            mvprintw(screen_y, code_start_x, "%s", buf);
-        }
+    if (!fgets(func_line, sizeof(func_line), dbg->addr2line_out)) {
+        return;
     }
 
-    refresh();
+    if (!fgets(result, sizeof(result), dbg->addr2line_out)) {
+        return;
+    }
+
+    result[strcspn(result, "\n")] = 0;
+
+    // Parse "filename:line" format
+    char *colon = strchr(result, ':');
+    if (colon) {
+        *colon = 0;
+        // Only update if it's not "??"
+        if (strcmp(result, "??") != 0) {
+            int new_line = atoi(colon + 1);
+            if (new_line > 0) {
+                dbg->current_line = new_line;
+            }
+        }
+    }
+}
+
+void dbg_read_output(Debugger *dbg) {
+    if (dbg->stdout_pipe[0] == -1) {
+        return;
+    }
+
+    char temp_buf[1024];
+    ssize_t n;
+
+    while ((n = read(dbg->stdout_pipe[0], temp_buf, sizeof(temp_buf) - 1)) > 0) {
+        int remaining = sizeof(dbg->output_buffer) - dbg->output_length - 1;
+        if (n > remaining) {
+            n = remaining;
+        }
+        if (n > 0) {
+            memcpy(dbg->output_buffer + dbg->output_length, temp_buf, n);
+            dbg->output_length += n;
+            dbg->output_buffer[dbg->output_length] = '\0';
+        }
+        if (remaining <= 0) break;
+    }
+}
+
+long dbg_read_memory(Debugger *dbg, unsigned long address) {
+    if (dbg->child_pid <= 0) {
+        return 0;
+    }
+
+    errno = 0;
+    long value = ptrace(PTRACE_PEEKDATA, dbg->child_pid, address, NULL);
+    if (errno != 0) {
+        return 0;
+    }
+    return value;
+}
+
+// Use readelf to parse DWARF and find variable locations
+void dbg_update_variables(Debugger *dbg) {
+    if (dbg->child_pid <= 0 || dbg->state != DBG_STATE_STOPPED) {
+        dbg->variable_count = 0;
+        return;
+    }
+
+    dbg->variable_count = 0;
+
+    // Use readelf to get DWARF debug info for variables
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+             "readelf --debug-dump=info %s 2>/dev/null | "
+             "grep -B 2 -A 5 'DW_TAG_variable'",
+             dbg->executable_path);
+
+    FILE *fp = popen(cmd, "r");
+    if (!fp) {
+        // Fallback: simple stack reading
+        for (int i = 0; i < 3; i++) {
+            snprintf(dbg->variables[i].name, 64, "var_%d", i);
+            dbg->variables[i].value = dbg_read_memory(dbg, dbg->registers.rbp - ((i+1)*8));
+            dbg->variables[i].valid = 1;
+            dbg->variables[i].is_pointer = 0;
+        }
+        dbg->variable_count = 3;
+        return;
+    }
+
+    char line[512];
+    char current_var[64] = {0};
+
+    while (fgets(line, sizeof(line), fp) && dbg->variable_count < DBG_MAX_VARS) {
+        // Look for variable name: DW_AT_name : x
+        if (strstr(line, "DW_AT_name") && strstr(line, ": ")) {
+            char *colon = strstr(line, ": ");
+            if (colon) {
+                colon += 2;
+                while (*colon == ' ') colon++;
+
+                int i = 0;
+                while (colon[i] && !isspace(colon[i]) && i < 63) {
+                    current_var[i] = colon[i];
+                    i++;
+                }
+                current_var[i] = '\0';
+            }
+        }
+
+        // Look for location: DW_AT_location : ... fbreg: -X
+        if (current_var[0] && strstr(line, "DW_AT_location") && strstr(line, "fbreg")) {
+            char *fbreg = strstr(line, "fbreg: ");
+            if (fbreg) {
+                int offset = atoi(fbreg + 7);
+
+                strncpy(dbg->variables[dbg->variable_count].name, current_var, 63);
+                dbg->variables[dbg->variable_count].value =
+                    dbg_read_memory(dbg, dbg->registers.rbp + offset);
+                dbg->variables[dbg->variable_count].valid = 1;
+                dbg->variables[dbg->variable_count].is_pointer = 0;
+                dbg->variable_count++;
+
+                current_var[0] = '\0';
+            }
+        }
+    }
+    pclose(fp);
+
+    // If no variables found via DWARF, use simple stack reading
+    if (dbg->variable_count == 0) {
+        for (int i = 0; i < 3; i++) {
+            snprintf(dbg->variables[i].name, 64, "[rbp-%d]", (i+1)*8);
+            dbg->variables[i].value = dbg_read_memory(dbg, dbg->registers.rbp - ((i+1)*8));
+            dbg->variables[i].valid = 1;
+            dbg->variables[i].is_pointer = 0;
+        }
+        dbg->variable_count = 3;
+    }
+}
+
+const char* dbg_state_string(DebuggerState state) {
+    switch (state) {
+        case DBG_STATE_NOT_STARTED: return "Not Started";
+        case DBG_STATE_RUNNING: return "Running";
+        case DBG_STATE_STOPPED: return "Stopped";
+        case DBG_STATE_EXITED: return "Exited";
+        case DBG_STATE_ERROR: return "Error";
+        default: return "Unknown";
+    }
 }
