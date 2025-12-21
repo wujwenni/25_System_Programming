@@ -1,6 +1,6 @@
 # CLI-based Lightweight IDE
 ![](./images/title.png)
-ncurses and ptrace를 사용한 터미널 기반 IDE 구현.
+ncurses and ptrace를 사용한 터미널 기반 IDE 구현. (AI generated image)
 
 ## Features
 
