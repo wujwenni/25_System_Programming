@@ -192,3 +192,9 @@ Built with:
 - ncurses for terminal UI
 - ptrace for process debugging
 - addr2line for address-to-line mapping
+
+## DEMO video
+
+[![DEMO](http://img.youtube.com/vi/Fzj9o_Z_4v0/0.jpg)]
+(https://youtu.be/Fzj9o_Z_4v0)
+
